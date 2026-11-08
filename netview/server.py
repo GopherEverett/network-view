@@ -108,6 +108,19 @@ class Inventory:
                     randomized_mac=scanner.is_randomized_mac(dev.mac),
                 )
                 rec["vendor"] = self.vendors.lookup(dev.mac) or rec.get("vendor")
+                if dev.quick_ports is not None:
+                    rec.update(quick_ports=dev.quick_ports, quick_ports_at=now)
+                # Devices don't answer mDNS/UPnP every time; keep what we learned.
+                info = dev.info
+                if info:
+                    rec.update(
+                        friendly_name=info.friendly_name or rec.get("friendly_name"),
+                        model=info.model or rec.get("model"),
+                        manufacturer=info.manufacturer or rec.get("manufacturer"),
+                        mdns_name=info.mdns_name or rec.get("mdns_name"),
+                        services=sorted(info.services | set(rec.get("services") or [])),
+                        upnp_types=sorted(info.upnp_types | set(rec.get("upnp_types") or [])),
+                    )
                 self._classify(rec)
             for key, rec in self.devices.items():
                 if key not in seen:
@@ -115,10 +128,20 @@ class Inventory:
                     rec["latency_ms"] = None
             self._save()
 
+    @staticmethod
+    def current_ports(rec: dict) -> list[int] | None:
+        """Ports from whichever check ran last: the full scan or the quick one."""
+        full_at, quick_at = rec.get("ports_scanned_at") or 0, rec.get("quick_ports_at") or 0
+        if rec.get("open_ports") is not None and full_at >= quick_at:
+            return rec["open_ports"]
+        return rec.get("quick_ports")
+
     def _classify(self, rec: dict) -> None:
-        rec["type"] = guess_type(rec.get("vendor"), rec.get("hostname"), rec.get("open_ports"),
-                                 rec.get("is_gateway", False), rec.get("is_self", False),
-                                 rec.get("randomized_mac", False))
+        rec["type"] = guess_type(
+            rec.get("vendor"), rec.get("hostname"), self.current_ports(rec),
+            rec.get("is_gateway", False), rec.get("is_self", False), rec.get("randomized_mac", False),
+            services=rec.get("services"), model=rec.get("model"),
+            friendly_name=rec.get("friendly_name"), upnp_types=rec.get("upnp_types"))
 
     def scan_ports(self, key: str) -> dict | None:
         with self.lock:
@@ -153,19 +176,19 @@ class Inventory:
 
     def snapshot(self) -> dict:
         with self.lock:
-            # Vendor DB may have finished downloading since the last scan.
+            # Vendor DB may have been refreshed since the last scan.
             for rec in self.devices.values():
-                if not rec.get("vendor") and rec.get("mac"):
-                    if v := self.vendors.lookup(rec["mac"]):
-                        rec["vendor"] = v
-                        self._classify(rec)
+                if rec.get("mac") and (v := self.vendors.lookup(rec["mac"])) and v != rec.get("vendor"):
+                    rec["vendor"] = v
+                    self._classify(rec)
             devices = sorted(self.devices.values(),
                              key=lambda d: (not d.get("online"), ipaddress.IPv4Address(d["ip"])))
             return {
                 "network": self.network.to_dict() if self.network else None,
                 "status": dict(self.status),
-                "vendor_db": {"source": self.vendors.source, "entries": len(self.vendors.table)},
+                "vendor_db": self.vendors.status(),
                 "port_names": scanner.COMMON_PORTS,
+                "quick_ports": scanner.QUICK_PORTS,
                 # Devices found on the very first scan are the baseline, not "new".
                 "baseline_until": (self.created_at + 60) if self.created_at else None,
                 "devices": devices,
@@ -224,6 +247,9 @@ def make_handler(inv: Inventory):
             if path == "/api/scan":
                 started = inv.start_scan()
                 return self._json({"started": started}, HTTPStatus.ACCEPTED)
+            if path == "/api/vendors/refresh":
+                started = inv.vendors.start_download()
+                return self._json({"started": started}, HTTPStatus.ACCEPTED)
             if path.startswith("/api/devices/") and path.endswith("/ports"):
                 rec = inv.scan_ports(self._device_key() or "")
                 return self._json(rec) if rec else self._json({"error": "unknown device"}, HTTPStatus.NOT_FOUND)
@@ -258,6 +284,7 @@ def main(argv=None) -> None:
     p.add_argument("--no-browser", action="store_true", help="don't open a browser window")
     args = p.parse_args(argv)
 
+    scanner.raise_file_limit()
     inv = Inventory(args.data_dir, args.cidr)
     inv.vendors.load(allow_download=not args.no_download)
     inv.network = scanner.detect_network(args.cidr)

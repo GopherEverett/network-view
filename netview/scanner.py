@@ -18,6 +18,8 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from .discovery import HostInfo, discover
+
 SYSTEM = platform.system()  # "Linux", "Darwin", "Windows"
 MAX_HOSTS = 1024  # never sweep more than a /22, even on huge subnets
 
@@ -31,6 +33,10 @@ COMMON_PORTS = {
     8080: "HTTP-proxy", 8443: "HTTPS-alt", 8123: "Home Assistant",
     9100: "Printer (RAW)", 32400: "Plex", 49152: "UPnP", 62078: "iPhone sync",
 }
+# Checked on every online device during each scan: each one says a lot about
+# what kind of device it is (printer, camera, Chromecast, iPhone, ...).
+QUICK_PORTS = (22, 80, 443, 445, 548, 554, 631, 1883, 3389, 7000, 8008, 8009,
+               8123, 9100, 32400, 62078)
 # Ports used to detect live hosts when ICMP ping is unavailable or blocked.
 PROBE_PORTS = (80, 443, 22, 445, 139, 62078, 8080)
 
@@ -64,7 +70,8 @@ class Device:
     hostname: str | None = None
     latency_ms: float | None = None
     discovered_by: set[str] = field(default_factory=set)
-    open_ports: list[int] | None = None
+    quick_ports: list[int] | None = None
+    info: "HostInfo | None" = None  # what the device announced over mDNS / UPnP
 
 
 # --------------------------------------------------------------------------
@@ -103,6 +110,21 @@ def is_randomized_mac(mac: str | None) -> bool:
     if not mac:
         return False
     return bool(int(mac.split(":")[0], 16) & 0x02)
+
+
+def raise_file_limit(target: int = 4096) -> None:
+    """Parallel probing opens many sockets/pipes; macOS defaults to only 256."""
+    try:
+        import resource
+    except ImportError:  # Windows
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ValueError, OSError):
+        pass
 
 
 def get_local_ip() -> str:
@@ -406,7 +428,7 @@ def netbios_name(ip: str, timeout_s: float = 0.6) -> str | None:
     return None
 
 
-def scan_ports(ip: str, ports=None, timeout_s: float = 0.5) -> list[int]:
+def scan_ports(ip: str, ports=None, timeout_s: float = 0.5, workers: int = 32) -> list[int]:
     ports = list(ports or COMMON_PORTS)
 
     def check(port: int) -> int | None:
@@ -417,7 +439,7 @@ def scan_ports(ip: str, ports=None, timeout_s: float = 0.5) -> list[int]:
             except OSError:
                 return None
 
-    with cf.ThreadPoolExecutor(max_workers=32) as pool:
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
         return sorted(p for p in pool.map(check, ports) if p is not None)
 
 
@@ -454,15 +476,46 @@ def scan(net: Network, progress=None, workers: int = 128) -> list[Device]:
     me.discovered_by.add("self")
 
     if progress:
-        progress("resolving names", 0, len(devices))
+        progress("identifying devices", 0, len(devices))
 
     def name_of(dev: Device):
         if dev.hostname:
             return dev.ip, dev.hostname
         return dev.ip, resolve_hostname(dev.ip) or netbios_name(dev.ip)
 
-    with cf.ThreadPoolExecutor(max_workers=32) as pool:
-        for ip, name in pool.map(name_of, list(devices.values())):
+    def quick_ports(dev: Device):
+        if dev.ip == net.local_ip:
+            return dev.ip, None
+        return dev.ip, scan_ports(dev.ip, QUICK_PORTS, timeout_s=0.6, workers=len(QUICK_PORTS))
+
+    # Names, mDNS/UPnP and the quick port check all wait on the network, so
+    # run them side by side. Pool sizes keep open sockets well under macOS's
+    # default 256-file limit (12 devices x 16 ports at a time).
+    with cf.ThreadPoolExecutor(max_workers=1) as disc_pool, \
+            cf.ThreadPoolExecutor(max_workers=24) as name_pool, \
+            cf.ThreadPoolExecutor(max_workers=12) as port_pool:
+        announced_f = disc_pool.submit(discover, list(devices), net.network, net.local_ip)
+        names = name_pool.map(name_of, list(devices.values()))
+        ports = port_pool.map(quick_ports, list(devices.values()))
+        for ip, name in names:
             devices[ip].hostname = name
+        for ip, open_ports in ports:
+            devices[ip].quick_ports = open_ports
+        try:
+            announced = announced_f.result()
+        except Exception:
+            announced = {}
+
+    arp = None
+    for ip, info in announced.items():
+        dev = devices.get(ip)
+        if dev is None and ipaddress.IPv4Address(ip) in net.network:
+            # Answered mDNS/SSDP but nothing else (rare, e.g. strict firewalls).
+            arp = arp if arp is not None else read_arp_table()
+            dev = devices[ip] = Device(ip=ip, mac=arp.get(ip))
+        if dev is not None:
+            dev.info = info
+            dev.discovered_by |= info.sources
+            dev.hostname = dev.hostname or info.mdns_name
 
     return sorted(devices.values(), key=lambda d: ipaddress.IPv4Address(d.ip))

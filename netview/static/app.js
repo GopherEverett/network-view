@@ -6,7 +6,7 @@ const TYPE_ICONS = {
   "This computer": "💻", "Router": "📡", "Computer": "🖥️", "Phone": "📱", "Tablet": "📱",
   "Phone / Tablet": "📱", "Apple device": "🍏", "TV / Streaming": "📺", "Game console": "🎮",
   "Printer": "🖨️", "Camera": "📷", "Smart home": "💡", "Network gear": "🔀",
-  "NAS / Server": "🗄️", "Unknown": "❔",
+  "NAS / Server": "🗄️", "Speaker": "🔊", "Smart watch": "⌚", "Unknown": "❔",
 };
 
 const state = {
@@ -32,7 +32,14 @@ function ago(ts) {
   return new Date(ts * 1000).toLocaleDateString();
 }
 const fullDate = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "—");
-const displayName = (d) => d.name || d.hostname || d.vendor || "Unknown device";
+// Custom name, then what the device calls itself, then DNS, then the maker.
+const displayName = (d) => d.name || d.friendly_name || d.hostname || d.model || d.vendor || "Unknown device";
+const portsOf = (d) => {
+  const full = d.ports_scanned_at || 0, quick = d.quick_ports_at || 0;
+  if (d.open_ports != null && full >= quick) return { ports: d.open_ports, at: full, quick: false };
+  if (d.quick_ports != null) return { ports: d.quick_ports, at: quick, quick: true };
+  return null;
+};
 const isNew = (d) => {
   const baseline = state.data?.baseline_until;
   return !!(baseline && d.first_seen > baseline && now() - d.first_seen < DAY);
@@ -58,7 +65,8 @@ async function refresh() {
 function schedulePoll() {
   clearTimeout(state.pollTimer);
   const scanning = state.data?.status.state === "scanning";
-  state.pollTimer = setTimeout(refresh, scanning ? 1000 : 15000);
+  const downloading = state.data?.vendor_db?.download?.state === "downloading";
+  state.pollTimer = setTimeout(refresh, scanning ? 1000 : downloading ? 3000 : 15000);
 }
 
 // ---------- rendering ----------
@@ -106,7 +114,7 @@ function render() {
   let rows = devices.filter((d) =>
     (state.show === "all" || (state.show === "online") === !!d.online) &&
     (!sel.value || d.type === sel.value) &&
-    (!q || [d.name, d.hostname, d.ip, d.mac, d.vendor, d.type, d.notes].some((v) => v && v.toLowerCase().includes(q))));
+    (!q || [d.name, d.friendly_name, d.hostname, d.model, d.manufacturer, d.ip, d.mac, d.vendor, d.type, d.notes].some((v) => v && v.toLowerCase().includes(q))));
   rows = sortRows(rows);
 
   $("rows").innerHTML = rows.map(rowHtml).join("");
@@ -121,9 +129,17 @@ function render() {
   });
 
   const vdb = state.data.vendor_db;
-  $("footnote").textContent = vdb.entries
-    ? `Vendor names from ${vdb.source} (${vdb.entries.toLocaleString()} prefixes).`
-    : "Vendor database not loaded yet — vendor names will appear once it downloads.";
+  const dl = vdb.download || {};
+  let note = vdb.entries
+    ? `Vendor names from the ${esc(vdb.source)} (${vdb.entries.toLocaleString()} prefixes${
+      vdb.updated_at ? `, updated ${new Date(vdb.updated_at * 1000).toLocaleDateString()}` : ""}).`
+    : "No vendor list loaded.";
+  if (dl.state === "downloading") note += " Downloading the latest list from the IEEE…";
+  if (dl.state === "failed") {
+    note += ` <span class="warn">Couldn't update it: ${esc(dl.error)}${dl.hint ? ` ${esc(dl.hint)}` : ""}</span>
+      <button class="link" id="vendorRetry">Retry</button>`;
+  }
+  $("footnote").innerHTML = note;
 
   if (state.selected) {
     const d = devices.find((x) => x.id === state.selected);
@@ -140,7 +156,9 @@ function rowHtml(d) {
     d.is_gateway ? `<span class="tag gw">router</span>` : "",
     isNew(d) ? `<span class="tag new">new</span>` : "",
   ].join("");
-  const sub = d.name && d.hostname ? d.hostname : "";
+  const shown = displayName(d);
+  const sub = [d.model !== shown && d.model, d.hostname !== shown && d.hostname]
+    .filter(Boolean).filter((v, i, a) => a.indexOf(v) === i).join(" · ");
   const mac = d.mac ? `${esc(d.mac)}${d.randomized_mac ? ` <span class="muted" title="Private / randomized MAC address">⟳</span>` : ""}` : "—";
   return `<tr data-id="${esc(d.id)}" class="${d.online ? "" : "offline"}">
     <td class="col-status"><span class="dot ${d.online ? "on" : ""}" title="${d.online ? "Online" : "Offline"}"></span></td>
@@ -198,10 +216,14 @@ function fillDrawer(d, resetInputs) {
     ["IP address", `<span class="mono">${esc(d.ip)}</span>`],
     ["MAC address", d.mac ? `<span class="mono">${esc(d.mac)}</span>` : "—"],
     ["Vendor", esc(d.vendor || (d.randomized_mac ? "Private address (randomized)" : "Unknown"))],
+    ["Announced as", esc(d.friendly_name || "—")],
+    ["Model", esc(d.model || "—")],
+    ...(d.manufacturer && d.manufacturer !== d.vendor ? [["Manufacturer", esc(d.manufacturer)]] : []),
     ["Hostname", esc(d.hostname || "—")],
     ["Type", `${TYPE_ICONS[d.type] || ""} ${esc(d.type)}`],
     ["Latency", d.latency_ms != null ? `${d.latency_ms} ms` : "—"],
     ["Found via", esc((d.discovered_by || []).join(", ") || "—")],
+    ...(d.services?.length ? [["Services", esc(d.services.join(", "))]] : []),
     ["First seen", esc(fullDate(d.first_seen))],
     ["Last seen", esc(d.online ? "Now" : fullDate(d.last_seen))],
   ];
@@ -212,13 +234,15 @@ function fillDrawer(d, resetInputs) {
   }
 
   const names = state.data.port_names;
-  if (d.open_ports == null) {
+  const known = portsOf(d);
+  if (!known) {
     $("dPortsInfo").textContent = "Not scanned yet.";
     $("dPorts").innerHTML = "";
   } else {
-    const when = d.ports_scanned_at ? ` (scanned ${ago(d.ports_scanned_at)})` : "";
-    $("dPortsInfo").textContent = d.open_ports.length ? `Open${when}:` : `No common ports open${when}.`;
-    $("dPorts").innerHTML = d.open_ports.map((p) => {
+    const what = known.quick ? `quick check of ${state.data.quick_ports.length} ports` : "full scan";
+    const when = ` (${what}${known.at ? `, ${ago(known.at)}` : ""})`;
+    $("dPortsInfo").textContent = known.ports.length ? `Open${when}:` : `None open${when}.`;
+    $("dPorts").innerHTML = known.ports.map((p) => {
       const web = [80, 8080, 8000, 3000, 5000, 8123, 32400].includes(p) ? "http" : [443, 8443].includes(p) ? "https" : null;
       const label = `<b>${p}</b> ${esc(names[p] || "")}`;
       return `<li>${web ? `<a href="${web}://${esc(d.ip)}:${p}/" target="_blank" rel="noopener">${label} ↗</a>` : label}</li>`;
@@ -234,6 +258,12 @@ $("scanBtn").addEventListener("click", async () => {
   refresh();
 });
 $("search").addEventListener("input", render);
+$("footnote").addEventListener("click", async (e) => {
+  if (e.target.id !== "vendorRetry") return;
+  e.target.disabled = true;
+  await api("/api/vendors/refresh", { method: "POST" }).catch(() => {});
+  refresh();
+});
 $("typeFilter").addEventListener("change", render);
 document.querySelectorAll(".seg button").forEach((b) => b.addEventListener("click", () => {
   state.show = b.dataset.show;
