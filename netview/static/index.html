@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Network View</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232f7de1' stroke-width='2.2' stroke-linecap='round'><circle cx='12' cy='5' r='2.5'/><circle cx='5' cy='19' r='2.5'/><circle cx='19' cy='19' r='2.5'/><path d='M12 7.5v4M12 11.5 6.5 17M12 11.5 17.5 17'/></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="19" r="2.5"/><circle cx="19" cy="19" r="2.5"/><path d="M12 7.5v4M12 11.5 6.5 17M12 11.5 17.5 17"/></svg>
+      <h1>Network View</h1>
+    </div>
+    <div class="net-info" id="netInfo">Detecting network…</div>
+    <button id="scanBtn" class="primary">Scan now</button>
+  </header>
+
+  <div class="progress" id="progress" hidden><div class="bar" id="progressBar"></div></div>
+
+  <main>
+    <section class="stats" id="stats"></section>
+
+    <section class="toolbar">
+      <input id="search" type="search" placeholder="Search name, IP, MAC, vendor…" autocomplete="off">
+      <select id="typeFilter"><option value="">All types</option></select>
+      <div class="seg" role="group" aria-label="Status filter">
+        <button data-show="online" class="on">Online</button>
+        <button data-show="all">All</button>
+        <button data-show="offline">Offline</button>
+      </div>
+    </section>
+
+    <div class="table-wrap">
+      <table id="devices">
+        <thead>
+          <tr>
+            <th data-sort="online" class="col-status"></th>
+            <th data-sort="display">Device</th>
+            <th data-sort="ip">IP address</th>
+            <th data-sort="mac" class="hide-sm">MAC address</th>
+            <th data-sort="vendor" class="hide-sm">Vendor</th>
+            <th data-sort="type">Type</th>
+            <th data-sort="latency_ms" class="num hide-sm">Latency</th>
+            <th data-sort="first_seen" class="hide-md">First seen</th>
+            <th data-sort="last_seen" class="hide-md">Last seen</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p class="empty" id="empty" hidden></p>
+    </div>
+    <p class="footnote" id="footnote"></p>
+  </main>
+
+  <aside class="drawer" id="drawer" aria-hidden="true">
+    <div class="drawer-head">
+      <h2 id="dTitle"></h2>
+      <button class="icon" id="dClose" aria-label="Close">✕</button>
+    </div>
+    <div class="drawer-body">
+      <dl class="kv" id="dFacts"></dl>
+
+      <label class="field">Custom name
+        <input id="dName" type="text" maxlength="200" placeholder="e.g. Living room TV">
+      </label>
+      <label class="field">Notes
+        <textarea id="dNotes" rows="3" maxlength="2000" placeholder="Anything worth remembering"></textarea>
+      </label>
+      <button id="dSave">Save</button>
+
+      <h3>Open ports</h3>
+      <p class="muted" id="dPortsInfo"></p>
+      <ul class="ports" id="dPorts"></ul>
+      <button id="dScanPorts">Scan common ports</button>
+
+      <hr>
+      <button id="dForget" class="danger">Forget this device</button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
