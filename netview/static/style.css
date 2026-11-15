@@ -83,6 +83,19 @@ input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px s
 
 main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 40px; }
 
+.banner {
+  border: 1px solid var(--new); border-radius: 12px; padding: 12px 16px; margin-bottom: 16px;
+  background: color-mix(in srgb, var(--new) 10%, var(--panel));
+}
+
+.banner-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.pill {
+  display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid currentColor; vertical-align: 1px;
+}
+.pill.ok { color: var(--online); }
+.pill.warn { color: var(--new); }
+
 /* ---- stats ---- */
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
 .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }

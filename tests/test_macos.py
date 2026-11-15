@@ -1,0 +1,170 @@
+import plistlib
+import shutil
+import subprocess
+import tempfile
+import unittest
+import zlib
+from pathlib import Path
+from unittest import mock
+
+from netview import macos
+
+
+class PlistTests(unittest.TestCase):
+    def test_launch_agent(self):
+        p = macos.launch_agent_plist("/opt/homebrew/bin/python3", ["--host", "0.0.0.0"])
+        self.assertEqual(p["Label"], "local.network-view")
+        self.assertEqual(p["ProgramArguments"],
+                         ["/opt/homebrew/bin/python3", "-m", "netview", "--no-browser", "--host", "0.0.0.0"])
+        self.assertTrue(p["RunAtLoad"])
+        self.assertTrue(p["KeepAlive"])
+        self.assertIn("/usr/sbin", p["EnvironmentVariables"]["PATH"])  # arp, ping live in sbin
+        self.assertEqual(p["EnvironmentVariables"]["PYTHONPATH"], str(macos.PROJECT_ROOT))
+        plistlib.dumps(p)  # serializable
+
+    def test_app_info(self):
+        info = macos.app_info_plist()
+        self.assertEqual(info["CFBundleExecutable"], "network-view")
+        self.assertTrue(info["LSUIElement"])
+        plistlib.dumps(info)
+
+
+class AppBundleTests(unittest.TestCase):
+    def test_build_app(self):
+        dest = Path(tempfile.mkdtemp()) / "Applications" / "Network View.app"
+        with mock.patch.object(macos, "make_icns", return_value=False):
+            macos.build_app(8800, dest)
+        exe = dest / "Contents" / "MacOS" / "network-view"
+        self.assertTrue(exe.stat().st_mode & 0o111)
+        script = exe.read_text()
+        self.assertIn("http://127.0.0.1:8800/api/devices", script)
+        self.assertIn("http://localhost:8800/", script)
+        with open(dest / "Contents" / "Info.plist", "rb") as f:
+            self.assertEqual(plistlib.load(f)["CFBundleName"], "Network View")
+        # Rebuilding replaces it cleanly
+        with mock.patch.object(macos, "make_icns", return_value=False):
+            macos.build_app(8801, dest)
+        self.assertIn("8801", exe.read_text())
+        self.assertFalse(dest.with_name(dest.name + ".tmp").exists())
+
+    @unittest.skipUnless(shutil.which("sh"), "needs sh")
+    def test_launcher_script_is_valid_shell(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+            f.write(macos.launcher_script(8765))
+        r = subprocess.run(["sh", "-n", f.name], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+
+class IconTests(unittest.TestCase):
+    def test_png(self):
+        png = macos.render_icon(64)
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        # Decode IDAT and check the corners are transparent and the centre is opaque
+        idat = png[png.index(b"IDAT") + 4:png.index(b"IEND") - 8]
+        raw = zlib.decompress(idat)
+        stride = 1 + 64 * 4
+        self.assertEqual(len(raw), 64 * stride)
+        px = lambda x, y: raw[y * stride + 1 + x * 4: y * stride + 1 + x * 4 + 4]
+        self.assertEqual(px(0, 0)[3], 0)
+        self.assertEqual(px(32, 50)[3], 255)
+
+
+class InstallFlowTests(unittest.TestCase):
+    """Install/uninstall with launchctl and the network replaced by fakes."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.calls = []
+        self.loaded = False
+        patches = [
+            mock.patch.object(macos, "PLIST", self.home / "Library/LaunchAgents/local.network-view.plist"),
+            mock.patch.object(macos, "APP", self.home / "Applications/Network View.app"),
+            mock.patch.object(macos, "LOG", self.home / "Library/Logs/network-view.log"),
+            mock.patch.object(macos, "HOME", self.home),
+            mock.patch.object(macos, "_run", side_effect=self.fake_run),
+            mock.patch.object(macos, "_service_loaded", side_effect=lambda: self.loaded),
+            mock.patch.object(macos, "make_icns", return_value=True),
+            mock.patch.object(macos, "_domain", return_value="gui/501"),
+            mock.patch.object(macos.time, "sleep"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def fake_run(self, cmd):
+        self.calls.append(cmd)
+        if cmd[:2] == ["launchctl", "bootstrap"]:
+            self.loaded = True
+        if cmd[:2] == ["launchctl", "bootout"]:
+            self.loaded = False
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def test_install_happy_path(self):
+        status = {"state": "idle", "last_scan": 1, "lan_blocked": False, "online": 7}
+        with mock.patch.object(macos, "_port_busy", return_value=False), \
+                mock.patch.object(macos, "_server_up", return_value=True), \
+                mock.patch.object(macos, "_first_scan_status", return_value=status), \
+                mock.patch("builtins.print") as out:
+            self.assertEqual(macos.install(["--host", "0.0.0.0", "--no-browser"]), 0)
+        text = "\n".join(str(c.args[0]) for c in out.call_args_list)
+        self.assertIn("Found 7 devices", text)
+        with open(macos.PLIST, "rb") as f:
+            argv = plistlib.load(f)["ProgramArguments"]
+        self.assertEqual(argv[-2:], ["--host", "0.0.0.0"])
+        self.assertEqual(argv.count("--no-browser"), 1)
+        self.assertTrue((macos.APP / "Contents/MacOS/network-view").exists())
+        self.assertIn(["launchctl", "bootstrap", "gui/501", str(macos.PLIST)], self.calls)
+        self.assertNotIn(["open", "http://localhost:8765/"], self.calls)  # --no-browser respected
+
+        # status reads the recorded options back
+        self.assertEqual(macos._installed_args(), ["--host", "0.0.0.0"])
+
+        # uninstall removes both
+        with mock.patch("builtins.print"):
+            self.assertEqual(macos.uninstall(), 0)
+        self.assertFalse(macos.PLIST.exists())
+        self.assertFalse(macos.APP.exists())
+        self.assertFalse(self.loaded)
+
+    def test_install_refuses_when_port_taken(self):
+        with mock.patch.object(macos, "_port_busy", return_value=True), mock.patch("builtins.print") as out:
+            self.assertEqual(macos.install([]), 1)
+        self.assertIn("in use", out.call_args_list[0].args[0])
+        self.assertFalse(macos.PLIST.exists())
+
+    def test_install_reports_blocked_local_network(self):
+        with mock.patch.object(macos, "_port_busy", return_value=False), \
+                mock.patch.object(macos, "_server_up", return_value=True), \
+                mock.patch.object(macos, "_first_scan_status", return_value={"lan_blocked": True}), \
+                mock.patch("builtins.print") as out:
+            macos.install(["--no-browser"])
+        text = "\n".join(str(c.args[0]) for c in out.call_args_list)
+        self.assertIn("Privacy & Security → Local Network", text)
+
+    def test_install_shows_log_when_service_fails(self):
+        macos.LOG.parent.mkdir(parents=True)
+        macos.LOG.write_text("Traceback...\nOSError: boom\n")
+        with mock.patch.object(macos, "_port_busy", return_value=False), \
+                mock.patch.object(macos, "_server_up", return_value=False), \
+                mock.patch.object(macos, "_wait_until_up", return_value=False), \
+                mock.patch("builtins.print") as out:
+            self.assertEqual(macos.install([]), 1)
+        self.assertIn("OSError: boom", out.call_args_list[-1].args[0])
+
+    def test_bad_options_rejected_before_installing(self):
+        with mock.patch("sys.stderr"):
+            self.assertEqual(macos.install(["--port", "not-a-number"]), 2)
+        self.assertFalse(macos.PLIST.exists())
+
+
+class EntryPointTests(unittest.TestCase):
+    def test_non_mac_explains(self):
+        r = subprocess.run([__import__("sys").executable, "-m", "netview", "status"],
+                           capture_output=True, text=True, cwd=macos.PROJECT_ROOT)
+        if __import__("sys").platform != "darwin":
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("macOS", r.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
