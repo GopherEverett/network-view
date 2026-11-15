@@ -80,6 +80,7 @@ function render() {
       (net.gateway ? ` · router <b>${esc(net.gateway)}</b>` : "") +
       (net.interface ? ` · <span class="mono">${esc(net.interface)}</span>` : "");
   }
+  $("lanBlocked").hidden = !status.lan_blocked;
   const scanning = status.state === "scanning";
   $("scanBtn").disabled = scanning;
   $("scanBtn").textContent = scanning ? "Scanning…" : "Scan now";

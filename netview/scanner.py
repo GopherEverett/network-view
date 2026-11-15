@@ -8,6 +8,7 @@ Works on Linux, macOS and Windows without root/admin rights.
 from __future__ import annotations
 
 import concurrent.futures as cf
+import errno
 import ipaddress
 import platform
 import re
@@ -316,6 +317,23 @@ def tcp_probe(ip: str, ports=PROBE_PORTS, timeout_s: float = 0.4) -> float | Non
         if code in (0, 111, 61, 10061):
             return round((time.perf_counter() - start) * 1000, 1)
     return None
+
+
+def local_network_blocked(gateway: str | None) -> bool:
+    """True when macOS's Local Network privacy setting is blocking us.
+
+    macOS 15+ asks before an app may talk to devices on the local network.
+    When the answer is no, sends to local addresses fail with EHOSTUNREACH
+    ("No route to host") even though the route plainly exists.
+    """
+    if SYSTEM != "Darwin" or not gateway:
+        return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(b"", (gateway, 9))
+        return False
+    except OSError as e:
+        return e.errno == errno.EHOSTUNREACH
 
 
 def nudge_arp(ip: str) -> None:

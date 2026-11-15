@@ -14,6 +14,39 @@ python3 -m netview
 
 Your browser opens to <http://localhost:8765>. The first scan of a typical home network (/24) takes about 5–30 seconds. After that the app rescans every 5 minutes.
 
+### On a Mac: run it in the background, with an app icon
+
+```bash
+python3 -m netview install
+```
+
+This takes care of the rest:
+- **Background service:** Network View starts when you log in, restarts if it ever stops, and keeps scanning all day. That makes history and "new device" alerts more useful.
+- **App icon:** **Network View** is added to `~/Applications`, so it shows up in Launchpad and Spotlight, and you can drag it to the Dock. Clicking it opens the dashboard and starts the service first if needed.
+- **Check:** the installer confirms the service can see your network and tells you what to fix if not.
+
+No admin password, Xcode or extra downloads are needed. Server options go after `install` and are kept for every start. For example, to use the Wi-Fi speed test from your phone:
+
+```bash
+python3 -m netview install --host 0.0.0.0
+```
+
+Run `install` again any time to change options. Two more commands:
+
+```bash
+python3 -m netview status
+```
+
+```bash
+python3 -m netview uninstall
+```
+
+`status` shows whether it's running, its options and recent log lines. `uninstall` removes the service and the app, but keeps your device history in `~/.network-view`.
+
+**Local Network permission (macOS 15 and later).** macOS asks before an app can reach devices on your network. Terminal already has permission, but the background service is a separate program. If macOS blocks it, the dashboard shows a banner and the installer says so. Open **System Settings → Privacy & Security → Local Network**, turn on **Python** (it may be listed as "python3"), then click **Scan now**. If Python doesn't appear in that list, run `python3 -m netview uninstall` and start Network View from Terminal instead, which uses Terminal's permission.
+
+The service runs the code from the folder you installed it from. After moving that folder, or after a `git pull` that changes the code, run `install` again (or `launchctl kickstart -k gui/$(id -u)/local.network-view`) so the service picks it up. The log is at `~/Library/Logs/network-view.log`.
+
 ### Options
 
 | Flag | Default | What it does |
@@ -95,6 +128,7 @@ netview/
   discovery.py mDNS/Bonjour and SSDP/UPnP: friendly names, models, services
   vendors.py   MAC vendor database + device-type heuristics
   speedtest.py internet speed test + result history
+  macos.py     install/status/uninstall: LaunchAgent + app bundle (icon drawn in code)
   data/        bundled IEEE vendor table (+ its license)
   server.py    JSON API, device history (devices.json), CLI entry point
   static/      dashboard (plain HTML/CSS/JS, no build step)

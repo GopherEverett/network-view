@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import json
 import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -76,6 +78,8 @@ class Inventory:
         try:
             net = scanner.detect_network(self.cidr)
             self.network = net
+            with self.lock:
+                self.status["lan_blocked"] = scanner.local_network_blocked(net.gateway)
             found = scanner.scan(net, progress=self._progress)
             self._merge(found, net, started)
             with self.lock:
@@ -347,8 +351,12 @@ def make_handler(inv: Inventory, speed: SpeedTester, listen: dict):
     return Handler
 
 
-def main(argv=None) -> None:
-    p = argparse.ArgumentParser(description="See every device on your local network.")
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python3 -m netview",
+        description="See every device on your local network.",
+        epilog="On macOS, 'python3 -m netview install' runs it in the background and adds an app icon. "
+               "See 'python3 -m netview install --help'.")
     p.add_argument("--host", default="127.0.0.1",
                    help="address to listen on (default 127.0.0.1; use 0.0.0.0 to reach it from other devices)")
     p.add_argument("--port", type=int, default=8765)
@@ -361,14 +369,36 @@ def main(argv=None) -> None:
     p.add_argument("--no-browser", action="store_true", help="don't open a browser window")
     p.add_argument("--speedtest-server", default=DEFAULT_SERVER, metavar="URL",
                    help=f"server for the internet speed test (default {DEFAULT_SERVER})")
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv=None) -> None:
+    args = build_parser().parse_args(argv)
 
     scanner.raise_file_limit()
     inv = Inventory(args.data_dir, args.cidr)
     inv.vendors.load(allow_download=not args.no_download)
     inv.network = scanner.detect_network(args.cidr)
-    inv.start_scan()
+    speed = SpeedTester(args.data_dir, args.speedtest_server)
+    # The Wi-Fi test is only meaningful from another device; tell the page the
+    # address other devices can use, when the server accepts them.
+    reachable = args.host in ("0.0.0.0", "", inv.network.local_ip)
+    listen = {"host": args.host, "port": args.port,
+              "lan_url": f"http://{inv.network.local_ip}:{args.port}" if reachable else None}
 
+    # Claim the port before doing anything else, and explain a clash plainly.
+    try:
+        server = ThreadingHTTPServer((args.host, args.port), make_handler(inv, speed, listen))
+    except OSError as e:
+        if e.errno in (errno.EADDRINUSE, 10048):
+            sys.exit(f"Port {args.port} is already in use, so Network View can't start.\n"
+                     f"  • If Network View is already running (in another terminal, or as the background\n"
+                     f"    service from 'python3 -m netview install'), just open http://localhost:{args.port}\n"
+                     f"  • To see what's using it:  lsof -nP -iTCP:{args.port} -sTCP:LISTEN\n"
+                     f"  • Or pick another port:    python3 -m netview --port {args.port + 1}")
+        raise
+
+    inv.start_scan()
     if args.interval > 0:
         def rescan_loop():
             while True:
@@ -376,18 +406,11 @@ def main(argv=None) -> None:
                 inv.start_scan()
         threading.Thread(target=rescan_loop, daemon=True).start()
 
-    speed = SpeedTester(args.data_dir, args.speedtest_server)
-    # The Wi-Fi test is only meaningful from another device; tell the page the
-    # address other devices can use, when the server accepts them.
-    reachable = args.host in ("0.0.0.0", "", inv.network.local_ip)
-    listen = {"host": args.host, "port": args.port,
-              "lan_url": f"http://{inv.network.local_ip}:{args.port}" if reachable else None}
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(inv, speed, listen))
     url = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{args.port}"
     net = inv.network
-    print(f"Network View running at {url}")
-    print(f"Scanning {net.network} on {net.interface or 'default interface'} (this computer: {net.local_ip})")
-    print("Press Ctrl+C to stop.")
+    print(f"Network View running at {url}", flush=True)
+    print(f"Scanning {net.network} on {net.interface or 'default interface'} (this computer: {net.local_ip})", flush=True)
+    print("Press Ctrl+C to stop.", flush=True)
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
