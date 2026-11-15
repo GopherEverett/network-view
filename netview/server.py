@@ -5,18 +5,23 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import socket
 import threading
 import time
 import webbrowser
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import scanner
+from .speedtest import DEFAULT_SERVER, SpeedTester
 from .vendors import VendorDB, guess_type
 
 STATIC_DIR = Path(__file__).parent / "static"
+LAN_MAX_DOWN = 100_000_000   # bytes per Wi-Fi test download request
+LAN_MAX_UP = 64_000_000      # bytes per Wi-Fi test upload request
+_LAN_BLOCK = bytes(256 * 1024)
 
 
 class Inventory:
@@ -195,17 +200,36 @@ class Inventory:
             }
 
 
-def make_handler(inv: Inventory):
+def make_handler(inv: Inventory, speed: SpeedTester, listen: dict):
     class Handler(SimpleHTTPRequestHandler):
+        # Keep-alive, so the Wi-Fi test's pings don't each pay for a new connection.
+        protocol_version = "HTTP/1.1"
+
         def __init__(self, *a, **kw):
+            self._body_consumed = False
             super().__init__(*a, directory=str(STATIC_DIR), **kw)
+
+        def setup(self):
+            super().setup()
+            # Headers and body go out as separate writes; without this, Nagle's
+            # algorithm + delayed ACKs add ~40 ms to every small response,
+            # which would wreck the Wi-Fi test's ping figure.
+            try:
+                self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
 
         def log_message(self, fmt, *args):  # keep the console quiet
             pass
 
         def _json(self, obj, status=HTTPStatus.OK):
+            # An unread request body would be parsed as the next request on a
+            # kept-alive connection, so close the connection instead.
+            unread = self.headers.get("Content-Length") not in (None, "0") and not self._body_consumed
             body = json.dumps(obj).encode()
             self.send_response(status)
+            if unread:
+                self.send_header("Connection", "close")  # also sets close_connection
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
@@ -221,6 +245,7 @@ def make_handler(inv: Inventory):
             length = int(self.headers.get("Content-Length") or 0)
             if not length:
                 return {}
+            self._body_consumed = length <= 65536
             try:
                 data = json.loads(self.rfile.read(min(length, 65536)))
                 return data if isinstance(data, dict) else {}
@@ -232,10 +257,55 @@ def make_handler(inv: Inventory):
             origin = self.headers.get("Origin")
             return origin is None or urlparse(origin).netloc == self.headers.get("Host")
 
+        def _lan_download(self):
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                size = max(0, min(int(qs.get("bytes", ["0"])[0]), LAN_MAX_DOWN))
+            except ValueError:
+                return self._json({"error": "bad size"}, HTTPStatus.BAD_REQUEST)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                while size > 0:
+                    n = min(size, len(_LAN_BLOCK))
+                    self.wfile.write(_LAN_BLOCK[:n] if n < len(_LAN_BLOCK) else _LAN_BLOCK)
+                    size -= n
+            except (BrokenPipeError, ConnectionResetError):  # browser stopped the test
+                self.close_connection = True
+
+        def _lan_upload(self):
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if not 0 <= length <= LAN_MAX_UP:
+                return self._json({"error": "bad size"}, HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            remaining = length
+            try:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 256 * 1024))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except (ConnectionResetError, TimeoutError):
+                self.close_connection = True
+                return
+            self._body_consumed = remaining == 0
+            return self._json({"received": length - remaining})
+
         def do_GET(self):
             path = urlparse(self.path).path
             if path == "/api/devices":
-                return self._json(inv.snapshot())
+                return self._json({**inv.snapshot(), "listen": listen})
+            if path == "/api/speedtest":
+                return self._json(speed.status())
+            if path == "/api/speedtest/lan/ping":
+                return self._json({"t": time.time()})
+            if path == "/api/speedtest/lan/down":
+                return self._lan_download()
             if path.startswith("/api/"):
                 return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             return super().do_GET()
@@ -247,6 +317,13 @@ def make_handler(inv: Inventory):
             if path == "/api/scan":
                 started = inv.start_scan()
                 return self._json({"started": started}, HTTPStatus.ACCEPTED)
+            if path == "/api/speedtest/start":
+                return self._json({"started": speed.start()}, HTTPStatus.ACCEPTED)
+            if path == "/api/speedtest/lan/up":
+                return self._lan_upload()
+            if path == "/api/speedtest/results":
+                rec = speed.add_wifi_result(self._body())
+                return self._json(rec) if rec else self._json({"error": "bad result"}, HTTPStatus.BAD_REQUEST)
             if path == "/api/vendors/refresh":
                 started = inv.vendors.start_download()
                 return self._json({"started": started}, HTTPStatus.ACCEPTED)
@@ -282,6 +359,8 @@ def main(argv=None) -> None:
                    help="where device history is stored (default ~/.network-view)")
     p.add_argument("--no-download", action="store_true", help="don't download the IEEE vendor database")
     p.add_argument("--no-browser", action="store_true", help="don't open a browser window")
+    p.add_argument("--speedtest-server", default=DEFAULT_SERVER, metavar="URL",
+                   help=f"server for the internet speed test (default {DEFAULT_SERVER})")
     args = p.parse_args(argv)
 
     scanner.raise_file_limit()
@@ -297,7 +376,13 @@ def main(argv=None) -> None:
                 inv.start_scan()
         threading.Thread(target=rescan_loop, daemon=True).start()
 
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(inv))
+    speed = SpeedTester(args.data_dir, args.speedtest_server)
+    # The Wi-Fi test is only meaningful from another device; tell the page the
+    # address other devices can use, when the server accepts them.
+    reachable = args.host in ("0.0.0.0", "", inv.network.local_ip)
+    listen = {"host": args.host, "port": args.port,
+              "lan_url": f"http://{inv.network.local_ip}:{args.port}" if reachable else None}
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(inv, speed, listen))
     url = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{args.port}"
     net = inv.network
     print(f"Network View running at {url}")
