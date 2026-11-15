@@ -336,6 +336,22 @@ def local_network_blocked(gateway: str | None) -> bool:
         return e.errno == errno.EHOSTUNREACH
 
 
+def gateway_mac(gateway: str | None) -> str | None:
+    """The router's MAC address: a stable ID for "which network is this?".
+
+    IP ranges repeat everywhere (lots of homes and hotels use 192.168.1.0/24),
+    but a router's MAC address is unique to that router.
+    """
+    if not gateway:
+        return None
+    mac = read_arp_table().get(gateway)
+    if not mac:
+        nudge_arp(gateway)  # one packet to the router, so its MAC is cached
+        time.sleep(0.3)
+        mac = read_arp_table().get(gateway)
+    return mac
+
+
 def nudge_arp(ip: str) -> None:
     """Send one UDP datagram so the OS resolves (and caches) the host's MAC."""
     try:

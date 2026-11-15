@@ -71,15 +71,19 @@ function schedulePoll() {
 
 // ---------- rendering ----------
 function render() {
-  const { network: net, status, devices } = state.data;
+  const { network: net, status, devices, home } = state.data;
 
   // Header
   if (net) {
     $("netInfo").innerHTML =
       `Subnet <b>${esc(net.cidr)}</b> · this computer <b>${esc(net.local_ip)}</b>` +
       (net.gateway ? ` · router <b>${esc(net.gateway)}</b>` : "") +
-      (net.interface ? ` · <span class="mono">${esc(net.interface)}</span>` : "");
+      (net.interface ? ` · <span class="mono">${esc(net.interface)}</span>` : "") +
+      (home?.current ? (home.current.trusted
+        ? ` · <span class="pill ok">${home.home_only ? "Trusted network" : "Scanning any network"}</span>`
+        : ` · <span class="pill warn">Not a trusted network</span>`) : "");
   }
+  renderHome(home, devices);
   $("lanBlocked").hidden = !status.lan_blocked;
   const scanning = status.state === "scanning";
   $("scanBtn").disabled = scanning;
@@ -93,7 +97,8 @@ function render() {
   const newToday = devices.filter(isNew);
   const lat = online.map((d) => d.latency_ms).filter((v) => v != null && v > 0);
   const avgLat = lat.length ? (lat.reduce((a, b) => a + b, 0) / lat.length).toFixed(1) : "—";
-  const lastScan = status.state === "error" ? `Error: ${esc(status.error)}`
+  const lastScan = status.state === "paused" ? "paused: not a trusted network"
+    : status.state === "error" ? `Error: ${esc(status.error)}`
     : scanning ? `${esc(status.phase || "starting")}…` : ago(status.last_scan);
   $("stats").innerHTML = [
     stat("Online now", online.length, `of ${devices.length} ever seen`),
@@ -255,9 +260,68 @@ function fillDrawer(d, resetInputs) {
 }
 
 // ---------- events ----------
-$("scanBtn").addEventListener("click", async () => {
+async function scanNow(force) {
   $("scanBtn").disabled = true;
-  await api("/api/scan", { method: "POST" }).catch(() => {});
+  await api("/api/scan", { method: "POST", body: JSON.stringify({ force }) }).catch(() => {});
+  refresh();
+}
+
+$("scanBtn").addEventListener("click", () => {
+  const cur = state.data?.home?.current;
+  if (cur && !cur.trusted) {
+    if (!confirm("This isn't one of your trusted networks. Scan it once anyway?\n\n" +
+                 "Only scan networks you own or have permission to scan.")) return;
+    return scanNow(true);
+  }
+  scanNow(false);
+});
+
+// ---------- trusted networks ----------
+function routerLabel(net, devices) {
+  const r = devices.find((d) => net.gateway_mac && d.mac === net.gateway_mac);
+  const name = r && (r.name || r.friendly_name || r.vendor);
+  return `${esc(net.cidr)}${name ? ` · ${esc(name)}` : ""}${net.gateway_mac ? ` <span class="mono">(${esc(net.gateway_mac)})</span>` : ""}`;
+}
+
+function renderHome(home, devices) {
+  const banner = $("homeBanner");
+  const cur = home?.current;
+  if (!cur || cur.trusted || !home.home_only) {
+    banner.hidden = true;
+  } else {
+    banner.hidden = false;
+    const first = !home.trusted.length;
+    banner.innerHTML = (first
+      ? `<b>Is this your home network?</b> Network View only scans networks you mark as yours, so it never
+         probes Wi-Fi that belongs to someone else, like a hotel, café or office.`
+      : `<b>You're not on a trusted network</b>, so automatic scans are paused here. Devices from your
+         other networks show as offline until you're back.`) +
+      `<div class="banner-actions"><button class="primary" data-act="trust">${first ? "Yes, this is my network" : "Trust this network"}</button>
+       <button data-act="scan-once">Scan once anyway</button></div>`;
+  }
+  const list = home?.trusted || [];
+  $("networksNote").innerHTML = !home?.home_only ? "Scanning on every network (--scan-any-network)."
+    : list.length ? `Trusted networks: ${list.map((n) =>
+      `${routerLabel(n, devices)}${cur?.id === n.id ? " <b>(current)</b>" : ""}
+       <button class="link" data-forget="${esc(n.id)}">Forget</button>`).join("; ")}`
+      : "";
+}
+
+$("homeBanner").addEventListener("click", async (e) => {
+  const act = e.target.dataset?.act;
+  if (act === "trust") {
+    e.target.disabled = true;
+    await api("/api/networks/trust", { method: "POST" }).catch(() => {});
+    refresh();
+  } else if (act === "scan-once") {
+    if (confirm("Only scan networks you own or have permission to scan. Continue?")) scanNow(true);
+  }
+});
+
+$("networksNote").addEventListener("click", async (e) => {
+  const id = e.target.dataset?.forget;
+  if (!id || !confirm("Forget this network? Automatic scans stop there until you trust it again.")) return;
+  await api(`/api/networks/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
   refresh();
 });
 $("search").addEventListener("input", render);

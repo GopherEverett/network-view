@@ -58,6 +58,7 @@ The service runs the code from the folder you installed it from. After moving th
 | `--data-dir` | `~/.network-view` | Where device history and the vendor database are kept |
 | `--no-download` | off | Don't download the IEEE vendor list |
 | `--no-browser` | off | Don't open a browser on start |
+| `--scan-any-network` | off | Scan automatically on every network, not just trusted ones |
 | `--speedtest-server` | `https://speed.cloudflare.com` | Server for the internet speed test (anything that serves the same `/__down` and `/__up` endpoints) |
 
 ## What you get
@@ -69,6 +70,19 @@ The service runs the code from the folder you installed it from. After moving th
 - **Device details**: click a row to give a device a friendly name and notes, scan its common ports (web UIs open in one click), or forget it.
 - **Type guessing** from what each device advertises, its model, a quick port check, its name and its vendor: router, phone, TV/streaming, speaker, printer, camera, smart home, NAS and so on.
 - **Private MAC detection**: phones that use randomized Wi-Fi addresses get a ⟳ icon.
+
+## Home networks only
+
+Network View only scans automatically on networks you've marked as yours. The first time it sees a network, the dashboard asks **"Is this your home network?"**. Until you say yes, nothing is scanned there.
+
+- **How it recognizes a network:** by your router's hardware (MAC) address, not its IP range. A hotel using the same `192.168.1.x` addresses as your home still counts as a different network.
+- **When you take a laptop elsewhere** (hotel, café, office), automatic scans pause and the dashboard says so. Your home devices show as offline until you're back. **Scan once anyway** is there if you really mean to, for example on a friend's network with their permission.
+- **When you get home,** Network View notices within 30 seconds and scans straight away. It checks which network it's on every 30 seconds, which costs one packet to the router.
+- **More than one network:** you can trust several, such as home and a holiday house. They're listed under the device table, each with a **Forget** link.
+- **Upgrading:** if your saved history mentions exactly one router and you're on it, it's trusted automatically. Otherwise the dashboard asks once.
+- **Opting out:** `--scan-any-network` restores scanning everywhere, for example on a desktop that never moves.
+
+Speed tests aren't affected: they don't scan anything.
 
 ## How discovery works
 
@@ -140,7 +154,9 @@ tests/         parser, protocol and heuristic tests with sample data
 | Method | Path | |
 |---|---|---|
 | `GET` | `/api/devices` | Network info, scan status, all devices |
-| `POST` | `/api/scan` | Start a scan (no-op if one is running) |
+| `POST` | `/api/scan` | Start a scan. On an untrusted network it returns 409 unless the body is `{"force": true}` |
+| `POST` | `/api/networks/trust` | Trust the current network and scan it |
+| `DELETE` | `/api/networks/{id}` | Stop trusting a network |
 | `POST` | `/api/vendors/refresh` | Re-download the IEEE vendor list |
 | `GET` | `/api/speedtest` | Speed test progress and result history |
 | `POST` | `/api/speedtest/start` | Start an internet speed test |

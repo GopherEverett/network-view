@@ -29,8 +29,11 @@ _LAN_BLOCK = bytes(256 * 1024)
 class Inventory:
     """Remembers every device ever seen, plus user-assigned names and notes."""
 
-    def __init__(self, data_dir: Path, cidr: str | None = None):
+    def __init__(self, data_dir: Path, cidr: str | None = None, home_only: bool = True):
         self.data_dir = data_dir
+        self.home_only = home_only   # only scan automatically on trusted networks
+        self.trusted: list[dict] = []
+        self.current: dict = {}      # the network we're on now: id, cidr, gateway
         self.file = data_dir / "devices.json"
         self.cidr = cidr
         self.lock = threading.RLock()
@@ -47,6 +50,7 @@ class Inventory:
             saved = json.loads(self.file.read_text())
             self.devices = saved["devices"]
             self.created_at = saved["created_at"]
+            self.trusted = saved.get("trusted_networks") or []
         except (OSError, ValueError, KeyError, TypeError):
             self.devices = {}
             self.created_at = None  # set on the first completed scan
@@ -56,31 +60,114 @@ class Inventory:
     def _save(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.file.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"created_at": self.created_at, "devices": self.devices},
-                                  indent=2, sort_keys=True))
+        tmp.write_text(json.dumps({"created_at": self.created_at, "devices": self.devices,
+                                   "trusted_networks": self.trusted}, indent=2, sort_keys=True))
         tmp.replace(self.file)
 
     # ---- scanning ----------------------------------------------------------
-    def start_scan(self) -> bool:
+    # ---- which network are we on? ------------------------------------------
+    @staticmethod
+    def network_id(net: scanner.Network, gw_mac: str | None) -> str:
+        if gw_mac:
+            return f"mac:{gw_mac}"
+        return f"net:{net.network}@{net.gateway or '-'}"  # no router MAC (VPN, odd setups)
+
+    def check_network(self) -> dict:
+        """Cheap check of the current network (one packet to the router at most)."""
+        net = scanner.detect_network(self.cidr)
+        gw_mac = scanner.gateway_mac(net.gateway)
+        net_id = self.network_id(net, gw_mac)
+        with self.lock:
+            previous = self.current.get("id")
+            self.network = net
+            self.current = {"id": net_id, "cidr": str(net.network), "gateway_ip": net.gateway,
+                            "gateway_mac": gw_mac}
+            if previous and previous != net_id:
+                # Moved networks: nothing from the old one is reachable now.
+                for rec in self.devices.values():
+                    rec["online"] = False
+                    rec["latency_ms"] = None
+                if self.status["state"] != "scanning":
+                    self.status["lan_blocked"] = False
+            self._adopt_existing_home()
+            return {**self.current, "trusted": self.is_trusted(), "changed": bool(previous and previous != net_id)}
+
+    def _adopt_existing_home(self) -> None:
+        """Upgrading from a version without trusted networks: if the saved history
+        points at exactly one router and we're on it, that's home."""
+        if self.trusted or not self.devices or not self.current.get("gateway_mac"):
+            return
+        routers = {r["mac"] for r in self.devices.values() if r.get("is_gateway") and r.get("mac")}
+        if routers == {self.current["gateway_mac"]}:
+            self._trust_current(save=True)
+
+    def is_trusted(self) -> bool:
+        if not self.home_only:
+            return True
+        return self.current.get("id") in {t["id"] for t in self.trusted}
+
+    def _trust_current(self, save: bool) -> dict:
+        entry = {"id": self.current["id"], "cidr": self.current["cidr"],
+                 "gateway_ip": self.current["gateway_ip"], "gateway_mac": self.current["gateway_mac"],
+                 "added_at": time.time()}
+        self.trusted = [t for t in self.trusted if t["id"] != entry["id"]] + [entry]
+        if save:
+            self._save()
+        return entry
+
+    def trust_current(self) -> dict | None:
+        with self.lock:
+            if not self.current:
+                return None
+            return self._trust_current(save=True)
+
+    def forget_network(self, net_id: str) -> bool:
+        with self.lock:
+            before = len(self.trusted)
+            self.trusted = [t for t in self.trusted if t["id"] != net_id]
+            if len(self.trusted) == before:
+                return False
+            self._save()
+            if not self.is_trusted() and self.status["state"] == "idle":
+                self.status["state"] = "paused"
+            return True
+
+    # ---- scanning ----------------------------------------------------------
+    def start_scan(self, force: bool = False) -> bool:
+        """Start a scan. Unless forced, only on a trusted network."""
         with self.lock:
             if self.status["state"] == "scanning":
                 return False
+            if not force and not self.is_trusted():
+                self.status.update(state="paused", phase=None)
+                return False
             self.status.update(state="scanning", phase="starting", done=0, total=0, error=None)
-        threading.Thread(target=self._scan, daemon=True).start()
+        threading.Thread(target=self._scan, args=(force,), daemon=True).start()
         return True
 
     def _progress(self, phase: str, done: int, total: int) -> None:
         with self.lock:
             self.status.update(phase=phase, done=done, total=total)
 
-    def _scan(self) -> None:
+    def _scan(self, force: bool = False) -> None:
         started = time.time()
         try:
-            net = scanner.detect_network(self.cidr)
-            self.network = net
+            info = self.check_network()
+            if not info["trusted"] and not force:  # moved off a trusted network meanwhile
+                with self.lock:
+                    self.status.update(state="paused", phase=None)
+                return
+            net = self.network
+            blocked = scanner.local_network_blocked(net.gateway)
             with self.lock:
-                self.status["lan_blocked"] = scanner.local_network_blocked(net.gateway)
+                self.status["lan_blocked"] = blocked
             found = scanner.scan(net, progress=self._progress)
+            if blocked and any(d.discovered_by & {"ping", "tcp", "mdns", "upnp"} and d.ip != net.local_ip
+                               for d in found):
+                # Devices answered, so we aren't really blocked: the router just
+                # refused that one test packet (some hotel/guest networks do).
+                with self.lock:
+                    self.status["lan_blocked"] = False
             self._merge(found, net, started)
             with self.lock:
                 self.status.update(state="idle", phase=None, last_scan=started,
@@ -198,6 +285,8 @@ class Inventory:
                 "vendor_db": self.vendors.status(),
                 "port_names": scanner.COMMON_PORTS,
                 "quick_ports": scanner.QUICK_PORTS,
+                "home": {"current": {**self.current, "trusted": self.is_trusted()} if self.current else None,
+                         "trusted": list(self.trusted), "home_only": self.home_only},
                 # Devices found on the very first scan are the baseline, not "new".
                 "baseline_until": (self.created_at + 60) if self.created_at else None,
                 "devices": devices,
@@ -319,8 +408,17 @@ def make_handler(inv: Inventory, speed: SpeedTester, listen: dict):
                 return self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
             path = urlparse(self.path).path
             if path == "/api/scan":
-                started = inv.start_scan()
+                force = bool(self._body().get("force"))
+                started = inv.start_scan(force=force)
+                if not started and not force and not inv.is_trusted():
+                    return self._json({"started": False, "error": "untrusted network"}, HTTPStatus.CONFLICT)
                 return self._json({"started": started}, HTTPStatus.ACCEPTED)
+            if path == "/api/networks/trust":
+                entry = inv.trust_current()
+                if not entry:
+                    return self._json({"error": "network not detected yet"}, HTTPStatus.CONFLICT)
+                inv.start_scan()
+                return self._json(entry)
             if path == "/api/speedtest/start":
                 return self._json({"started": speed.start()}, HTTPStatus.ACCEPTED)
             if path == "/api/speedtest/lan/up":
@@ -339,13 +437,21 @@ def make_handler(inv: Inventory, speed: SpeedTester, listen: dict):
         def do_PATCH(self):
             if not self._same_origin():
                 return self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
+            if not urlparse(self.path).path.startswith("/api/devices/"):
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             rec = inv.update(self._device_key() or "", self._body())
             return self._json(rec) if rec else self._json({"error": "unknown device"}, HTTPStatus.NOT_FOUND)
 
         def do_DELETE(self):
             if not self._same_origin():
                 return self._json({"error": "forbidden"}, HTTPStatus.FORBIDDEN)
-            ok = inv.forget(self._device_key() or "")
+            path = urlparse(self.path).path
+            if path.startswith("/api/networks/"):
+                ok = inv.forget_network(self._device_key() or "")
+            elif path.startswith("/api/devices/"):
+                ok = inv.forget(self._device_key() or "")
+            else:
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
             return self._json({"deleted": ok}, HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND)
 
     return Handler
@@ -367,6 +473,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="where device history is stored (default ~/.network-view)")
     p.add_argument("--no-download", action="store_true", help="don't download the IEEE vendor database")
     p.add_argument("--no-browser", action="store_true", help="don't open a browser window")
+    p.add_argument("--scan-any-network", action="store_true",
+                   help="scan automatically on every network, not just ones you've marked as trusted")
     p.add_argument("--speedtest-server", default=DEFAULT_SERVER, metavar="URL",
                    help=f"server for the internet speed test (default {DEFAULT_SERVER})")
     return p
@@ -376,9 +484,9 @@ def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
 
     scanner.raise_file_limit()
-    inv = Inventory(args.data_dir, args.cidr)
+    inv = Inventory(args.data_dir, args.cidr, home_only=not args.scan_any_network)
     inv.vendors.load(allow_download=not args.no_download)
-    inv.network = scanner.detect_network(args.cidr)
+    inv.check_network()
     speed = SpeedTester(args.data_dir, args.speedtest_server)
     # The Wi-Fi test is only meaningful from another device; tell the page the
     # address other devices can use, when the server accepts them.
@@ -398,18 +506,30 @@ def main(argv=None) -> None:
                      f"  • Or pick another port:    python3 -m netview --port {args.port + 1}")
         raise
 
-    inv.start_scan()
-    if args.interval > 0:
-        def rescan_loop():
-            while True:
-                time.sleep(args.interval)
-                inv.start_scan()
-        threading.Thread(target=rescan_loop, daemon=True).start()
+    inv.start_scan()  # pauses itself if this isn't a trusted network
+
+    def watch_network():
+        """Every 30 s: notice network changes; rescan on schedule (trusted networks only)."""
+        last_auto = time.time()
+        while True:
+            time.sleep(30)
+            try:
+                info = inv.check_network()
+            except Exception:
+                continue
+            due = args.interval > 0 and time.time() - last_auto >= args.interval
+            if info["changed"] or due:
+                if inv.start_scan():
+                    last_auto = time.time()
+    threading.Thread(target=watch_network, daemon=True).start()
 
     url = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{args.port}"
     net = inv.network
     print(f"Network View running at {url}", flush=True)
-    print(f"Scanning {net.network} on {net.interface or 'default interface'} (this computer: {net.local_ip})", flush=True)
+    print(f"Network {net.network} on {net.interface or 'default interface'} (this computer: {net.local_ip})", flush=True)
+    if not inv.is_trusted():
+        print("This network isn't marked as trusted, so automatic scans are paused. Open the\n"
+              "dashboard and choose “Trust this network” if it's yours.", flush=True)
     print("Press Ctrl+C to stop.", flush=True)
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

@@ -285,7 +285,8 @@ def _first_scan_status(port: int, seconds: float = 90) -> dict | None:
             with opener.open(f"http://127.0.0.1:{port}/api/devices", timeout=2) as r:
                 data = json.loads(r.read())
             st = data["status"]
-            if st.get("lan_blocked") or (st.get("state") != "scanning" and st.get("last_scan")):
+            if (st.get("lan_blocked") or st.get("state") == "paused"
+                    or (st.get("state") != "scanning" and st.get("last_scan"))):
                 return {**st, "online": sum(1 for d in data["devices"] if d.get("online"))}
         except Exception:
             pass
@@ -347,6 +348,9 @@ def install(server_args: list[str]) -> int:
               "  Open System Settings → Privacy & Security → Local Network and turn on Python\n"
               "  (it may be listed as “python3”). Then run: python3 -m netview status\n"
               "  If Python isn't listed there, see the README's macOS section.")
+    elif st and st.get("state") == "paused":
+        print("• This network isn't marked as your home network, so scanning is paused.\n"
+              "  If it is yours, open the app and click “Trust this network”.")
     elif st:
         print(f"✓ Found {st['online']} device{'s' if st['online'] != 1 else ''} on your network.")
     else:
