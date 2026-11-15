@@ -25,11 +25,13 @@ Your browser opens to <http://localhost:8765>. The first scan of a typical home 
 | `--data-dir` | `~/.network-view` | Where device history and the vendor database are kept |
 | `--no-download` | off | Don't download the IEEE vendor list |
 | `--no-browser` | off | Don't open a browser on start |
+| `--speedtest-server` | `https://speed.cloudflare.com` | Server for the internet speed test (anything that serves the same `/__down` and `/__up` endpoints) |
 
 ## What you get
 
 - **Names devices themselves announce**: "Living Room TV", "Kitchen", "Brother HL-L2350DW", heard over Bonjour/mDNS and UPnP, plus the model (e.g. "Chromecast Ultra", "iPhone15,2").
 - **Live device table**: online/offline status, name, IP, MAC, vendor, type and latency. It can be sorted, searched, and filtered by type or status.
+- **Speed tests**: one button tests your internet connection, another tests Wi-Fi between any phone or laptop and the computer running Network View. Every result is kept, with a history chart.
 - **History**: each device is remembered by its MAC address, with first-seen and last-seen times. Devices that join after the first scan get a **new** badge for 24 hours.
 - **Device details**: click a row to give a device a friendly name and notes, scan its common ports (web UIs open in one click), or forget it.
 - **Type guessing** from what each device advertises, its model, a quick port check, its name and its vendor: router, phone, TV/streaming, speaker, printer, camera, smart home, NAS and so on.
@@ -46,6 +48,26 @@ Your browser opens to <http://localhost:8765>. The first scan of a typical home 
 5. Look up names with reverse DNS, falling back to a NetBIOS query (Windows PCs, NAS boxes).
 6. Check 16 revealing ports on every online device (printer, camera, Chromecast, iPhone sync, Plex, SMB, RDP, ...). The "Scan common ports" button in the details panel still runs the full 35-port check.
 7. Look up the vendor from the MAC prefix. A complete copy of the IEEE registry ships with the app (`netview/data/oui.tsv.gz`, from the [oui-data](https://www.npmjs.com/package/oui-data) package, BSD-2-Clause), so this works offline. The app also tries to refresh it from the IEEE once a month. If that fails, the reason and a Retry button appear under the device table.
+
+## Speed tests
+
+**Internet speed** measures this computer's connection against Cloudflare's speed-test servers (the ones behind speed.cloudflare.com). No account or extra software is needed.
+- **Ping and jitter:** a dozen tiny requests.
+- **Download and upload:** six parallel streams. The first 2 seconds are ignored while connections ramp up.
+- **Duration and data:** each direction runs for up to 10 seconds, or stops after 4 seconds once 150 MB has moved. A test takes up to 25 seconds and uses roughly 100–500 MB of data, more on very fast connections, so be careful on a metered link.
+- **Privacy:** Cloudflare sees your public IP address, as with any speed test website.
+
+**Wi-Fi speed** measures the link between the device you're viewing the dashboard on and the computer running Network View. Nothing leaves your network. To use it:
+
+```bash
+python3 -m netview --host 0.0.0.0
+```
+
+Then open `http://<this computer's IP>:8765` on your phone. The Wi-Fi card shows the exact address. When you view the dashboard on the computer running Network View, the Wi-Fi test is unavailable, because there's no Wi-Fi between them.
+
+If the computer is itself on Wi-Fi, the result covers both wireless hops (phone → router → computer). Plug the computer into the router with a cable to measure just the phone's Wi-Fi. Moving around the house with the phone and re-testing is a quick way to find dead spots.
+
+Results are saved to `~/.network-view/speedtests.json`, and the chart shows the last 40 of each kind.
 
 Some devices may still be missing or show partial details:
 - Devices on a guest Wi-Fi or another VLAN can't be seen, because ARP doesn't cross routers.
@@ -72,6 +94,7 @@ netview/
   scanner.py   subnet detection, ping/TCP sweep, ARP parsing, names, port scan
   discovery.py mDNS/Bonjour and SSDP/UPnP: friendly names, models, services
   vendors.py   MAC vendor database + device-type heuristics
+  speedtest.py internet speed test + result history
   data/        bundled IEEE vendor table (+ its license)
   server.py    JSON API, device history (devices.json), CLI entry point
   static/      dashboard (plain HTML/CSS/JS, no build step)
@@ -85,6 +108,10 @@ tests/         parser, protocol and heuristic tests with sample data
 | `GET` | `/api/devices` | Network info, scan status, all devices |
 | `POST` | `/api/scan` | Start a scan (no-op if one is running) |
 | `POST` | `/api/vendors/refresh` | Re-download the IEEE vendor list |
+| `GET` | `/api/speedtest` | Speed test progress and result history |
+| `POST` | `/api/speedtest/start` | Start an internet speed test |
+| `POST` | `/api/speedtest/results` | Save a Wi-Fi test result (sent by the browser) |
+| `GET`/`POST` | `/api/speedtest/lan/ping`, `/down?bytes=N`, `/up` | Wi-Fi test endpoints (capped at 100 MB down / 64 MB up per request) |
 | `POST` | `/api/devices/{id}/ports` | Scan common ports on a device |
 | `PATCH` | `/api/devices/{id}` | Set `name` / `notes` |
 | `DELETE` | `/api/devices/{id}` | Forget a device |

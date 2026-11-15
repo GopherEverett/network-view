@@ -22,6 +22,48 @@
   <main>
     <section class="stats" id="stats"></section>
 
+    <section class="speed" aria-label="Speed tests">
+      <div class="speed-card" id="spInternet">
+        <div class="speed-head">
+          <div>
+            <h2>Internet speed</h2>
+            <p class="muted" id="spInternetSub">This computer ↔ the internet</p>
+          </div>
+          <button id="spInternetBtn">Run test</button>
+        </div>
+        <div class="metrics" id="spInternetMetrics"></div>
+        <div class="sp-progress" hidden><div class="bar"></div></div>
+        <p class="sp-status muted" id="spInternetStatus"></p>
+      </div>
+      <div class="speed-card" id="spWifi">
+        <div class="speed-head">
+          <div>
+            <h2>Wi-Fi speed</h2>
+            <p class="muted">This device ↔ the computer running Network View</p>
+          </div>
+          <button id="spWifiBtn">Run test</button>
+        </div>
+        <div class="metrics" id="spWifiMetrics"></div>
+        <div class="sp-progress" hidden><div class="bar"></div></div>
+        <p class="sp-status muted" id="spWifiStatus"></p>
+      </div>
+      <div class="speed-card speed-history">
+        <div class="speed-head">
+          <h2>Speed history</h2>
+          <div class="seg small" role="group" aria-label="History to show">
+            <button data-kind="internet" class="on">Internet</button>
+            <button data-kind="wifi">Wi-Fi</button>
+          </div>
+        </div>
+        <div class="legend" id="spLegend"></div>
+        <div class="chart" id="spChart"></div>
+        <details class="sp-table">
+          <summary>Show as table</summary>
+          <div class="table-scroll"><table id="spTable"></table></div>
+        </details>
+      </div>
+    </section>
+
     <section class="toolbar">
       <input id="search" type="search" placeholder="Search name, IP, MAC, vendor…" autocomplete="off">
       <select id="typeFilter"><option value="">All types</option></select>
@@ -82,5 +124,6 @@
   <div class="scrim" id="scrim" hidden></div>
 
   <script src="app.js"></script>
+  <script src="speedtest.js"></script>
 </body>
 </html>

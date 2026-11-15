@@ -145,6 +145,8 @@ function render() {
     const d = devices.find((x) => x.id === state.selected);
     if (d) fillDrawer(d, false);
   }
+  // The Wi-Fi card needs the server's LAN address, which comes with this data.
+  if (typeof renderWifi === "function") renderWifi();
 }
 
 const stat = (label, value, sub) =>
