@@ -69,6 +69,36 @@ class IconTests(unittest.TestCase):
         self.assertEqual(px(32, 50)[3], 255)
 
 
+def _fake_interpreter(where: Path, works: bool) -> Path:
+    """Stand-in for Python.app's executable: a script that runs this Python."""
+    exe = where / ("python-ok" if works else "python-broken")
+    exe.write_text(f"#!/bin/sh\nexec {__import__('sys').executable} \"$@\"\n" if works else "#!/bin/sh\nexit 1\n")
+    exe.chmod(0o755)
+    return exe
+
+
+class AgentTests(unittest.TestCase):
+    def test_agent_bundle(self):
+        app = Path(tempfile.mkdtemp()) / "Network View.app"
+        with mock.patch.object(macos, "real_interpreter", return_value=_fake_interpreter(app.parent, True)):
+            exe = macos.build_agent(app)
+        self.assertEqual(exe.name, "Network View Agent")
+        with open(app / macos.AGENT_REL / "Contents/Info.plist", "rb") as f:
+            info = plistlib.load(f)
+        self.assertEqual(info["CFBundleName"], "Network View")
+        self.assertEqual(info["CFBundleExecutable"], exe.name)
+        self.assertIn("NSLocalNetworkUsageDescription", info)
+        self.assertTrue(info["LSBackgroundOnly"])
+
+    def test_no_framework_python(self):
+        with mock.patch.object(macos, "real_interpreter", return_value=None):
+            self.assertIsNone(macos.build_agent(Path(tempfile.mkdtemp())))
+
+    def test_launch_agent_names_the_app(self):
+        p = macos.launch_agent_plist("/x/Network View Agent", [])
+        self.assertEqual(p["AssociatedBundleIdentifiers"], ["local.network-view.launcher"])
+
+
 class InstallFlowTests(unittest.TestCase):
     """Install/uninstall with launchctl and the network replaced by fakes."""
 
@@ -132,14 +162,54 @@ class InstallFlowTests(unittest.TestCase):
         self.assertIn("in use", out.call_args_list[0].args[0])
         self.assertFalse(macos.PLIST.exists())
 
-    def test_install_reports_blocked_local_network(self):
+    def test_install_waits_for_allow(self):
+        statuses = [{"lan_blocked": True, "state": "idle", "last_scan": 100},
+                    {"lan_blocked": False, "state": "idle", "last_scan": 200, "online": 9}]
         with mock.patch.object(macos, "_port_busy", return_value=False), \
                 mock.patch.object(macos, "_server_up", return_value=True), \
-                mock.patch.object(macos, "_first_scan_status", return_value={"lan_blocked": True}), \
+                mock.patch.object(macos, "_first_scan_status", side_effect=statuses) as fss, \
                 mock.patch("builtins.print") as out:
             macos.install(["--no-browser"])
         text = "\n".join(str(c.args[0]) for c in out.call_args_list)
         self.assertIn("Privacy & Security → Local Network", text)
+        self.assertIn("Found 9 devices", text)
+        self.assertEqual(fss.call_args_list[1].kwargs["after"], 100)  # waits for a newer scan
+
+    def test_install_still_blocked(self):
+        with mock.patch.object(macos, "_port_busy", return_value=False), \
+                mock.patch.object(macos, "_server_up", return_value=True), \
+                mock.patch.object(macos, "_first_scan_status", side_effect=[{"lan_blocked": True}, None]), \
+                mock.patch("builtins.print") as out:
+            macos.install(["--no-browser"])
+        self.assertIn("Still blocked", "\n".join(str(c.args[0]) for c in out.call_args_list))
+
+    def test_service_runs_agent_when_available(self):
+        fake_python = _fake_interpreter(self.home, works=True)
+        with mock.patch.object(macos, "real_interpreter", return_value=fake_python), \
+                mock.patch.object(macos, "_port_busy", return_value=False), \
+                mock.patch.object(macos, "_server_up", return_value=True), \
+                mock.patch.object(macos, "_first_scan_status", return_value={"state": "idle", "last_scan": 1,
+                                                                             "online": 3}), \
+                mock.patch("builtins.print"):
+            macos.install(["--no-browser"])
+        with open(macos.PLIST, "rb") as f:
+            program = plistlib.load(f)["ProgramArguments"][0]
+        self.assertEqual(program, str(macos.APP / macos.AGENT_REL / "Contents/MacOS/Network View Agent"))
+        self.assertTrue(Path(program).exists())
+
+    def test_service_falls_back_to_python3(self):
+        fake_python = _fake_interpreter(self.home, works=False)
+        with mock.patch.object(macos, "real_interpreter", return_value=fake_python), \
+                mock.patch.object(macos, "_port_busy", return_value=False), \
+                mock.patch.object(macos, "_server_up", return_value=True), \
+                mock.patch.object(macos, "_first_scan_status", return_value={"state": "idle", "last_scan": 1,
+                                                                             "online": 3}), \
+                mock.patch("builtins.print") as out:
+            macos.install(["--no-browser"])
+        with open(macos.PLIST, "rb") as f:
+            self.assertEqual(plistlib.load(f)["ProgramArguments"][0], __import__("sys").executable)
+        self.assertFalse((macos.APP / macos.AGENT_REL).exists())
+        self.assertIn("can't run as the service's own app", "\n".join(str(c.args[0]) for c in out.call_args_list))
 
     def test_install_shows_log_when_service_fails(self):
         macos.LOG.parent.mkdir(parents=True)
