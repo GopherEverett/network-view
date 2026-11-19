@@ -119,6 +119,85 @@ class SpeedTestTests(unittest.TestCase):
         self.assertEqual(st.status()["history"][-1]["kind"], "wifi")
 
 
+class RateLimitingCloudflare(FakeCloudflare):
+    """FakeCloudflare that answers some requests with HTTP 429."""
+    policy = "none"   # "latency-once", "some-streams", "always"
+    counts = {"latency": 0, "download": 0}
+    lock = threading.Lock()
+
+    def _too_many(self, retry_after):
+        self.send_response(429)
+        self.send_header("Retry-After", str(retry_after))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        size = int(parse_qs(urlparse(self.path).query).get("bytes", ["0"])[0])
+        kind = "latency" if size == 0 else "download"
+        with self.lock:
+            self.counts[kind] += 1
+            n = self.counts[kind]
+        p = self.policy
+        if p == "always" or (p == "latency-once" and kind == "latency" and n == 2) \
+                or (p == "some-streams" and kind == "download" and n <= 3):
+            return self._too_many(120 if p == "always" else (1 if kind == "latency" else 300))
+        return super().do_GET()
+
+
+class RateLimitTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), RateLimitingCloudflare)
+        cls.server.daemon_threads = True
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.url = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        cls.saved = (speedtest.MAX_PHASE_S, speedtest.MIN_PHASE_S, speedtest.WARMUP_S)
+        speedtest.MAX_PHASE_S, speedtest.MIN_PHASE_S, speedtest.WARMUP_S = 2.5, 2.0, 0.5
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        speedtest.MAX_PHASE_S, speedtest.MIN_PHASE_S, speedtest.WARMUP_S = cls.saved
+
+    def run_test(self, policy):
+        RateLimitingCloudflare.policy = policy
+        RateLimitingCloudflare.counts = {"latency": 0, "download": 0}
+        st = SpeedTester(Path(tempfile.mkdtemp()), self.url)
+        st.start()
+        deadline = time.time() + 30
+        while st.status()["state"] == "running" and time.time() < deadline:
+            time.sleep(0.1)
+        return st
+
+    def test_brief_limit_during_ping_is_retried(self):
+        st = self.run_test("latency-once")
+        status = st.status()
+        self.assertEqual(status["state"], "idle", status.get("error"))
+        self.assertNotIn("limited", status["history"][-1])
+
+    def test_some_streams_limited_still_measures(self):
+        st = self.run_test("some-streams")
+        status = st.status()
+        self.assertEqual(status["state"], "idle", status.get("error"))
+        r = status["history"][-1]
+        self.assertTrue(r["limited"])
+        self.assertGreater(r["download_mbps"], 0)
+
+    def test_hard_limit_cools_down(self):
+        st = self.run_test("always")
+        status = st.status()
+        self.assertEqual(status["state"], "error")
+        self.assertIn("Try again in about 2 minutes", status["error"])
+        self.assertGreater(status["cooldown_until"], time.time() + 100)
+        self.assertEqual(status["history"], [])
+        # Starting again during the cooldown doesn't touch the server
+        before = dict(RateLimitingCloudflare.counts)
+        self.assertFalse(st.start())
+        self.assertEqual(RateLimitingCloudflare.counts, before)
+        self.assertIn("Cloudflare is limiting", st.status()["error"])
+
+
 class LanEndpointTests(unittest.TestCase):
     """The Wi-Fi test endpoints on the real Network View server."""
 
