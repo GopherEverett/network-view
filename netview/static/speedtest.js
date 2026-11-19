@@ -42,7 +42,12 @@ function renderInternet() {
   if (!s) return;
   const card = $("spInternet");
   const running = s.state === "running";
-  $("spInternetBtn").disabled = running;
+  const coolingDown = s.cooldown_until && s.cooldown_until > now();
+  $("spInternetBtn").disabled = running || coolingDown;
+  if (coolingDown) {  // re-enable the button when the wait is over
+    clearTimeout(sp.cooldownTimer);
+    sp.cooldownTimer = setTimeout(renderInternet, (s.cooldown_until - now()) * 1000 + 500);
+  }
   $("spInternetBtn").textContent = running ? "Testing…" : "Run test";
   const last = lastOf("internet");
   if (running) {
@@ -64,7 +69,8 @@ function renderInternet() {
   } else {
     st.className = "sp-status muted";
     st.textContent = last
-      ? `Tested ${ago(last.at)}${last.server ? ` via Cloudflare ${last.server}` : ""} · used ${last.data_mb} MB of data`
+      ? `Tested ${ago(last.at)}${last.server ? ` via Cloudflare ${last.server}` : ""} · used ${last.data_mb} MB of data` +
+        (last.limited ? " · Cloudflare limited part of this test, so speeds may read a little low" : "")
       : "Not tested yet. A test takes up to 25 seconds and uses roughly 100–500 MB of data.";
   }
 }
