@@ -35,6 +35,10 @@ HOME = Path.home()
 PLIST = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 APP = HOME / "Applications" / "Network View.app"
 LOG = HOME / "Library" / "Logs" / "network-view.log"
+AGENT_ID = f"{LABEL}.agent"
+AGENT_REL = Path("Contents") / "Library" / "Network View Agent.app"
+AGENT_EXE_NAME = "Network View Agent"
+LOCAL_NETWORK_REASON = "Network View scans your home network to list the devices connected to it."
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -80,6 +84,23 @@ def _installed_args() -> list[str]:
         return []
 
 
+def _installed_program() -> str:
+    try:
+        with open(PLIST, "rb") as f:
+            return plistlib.load(f)["ProgramArguments"][0]
+    except (OSError, KeyError, IndexError, plistlib.InvalidFileException):
+        return ""
+
+
+_ALLOW_HELP = ("macOS needs your OK for Network View to see your network. Look for the message\n"
+               "  “Network View” would like to find devices on your local network, and click Allow.\n"
+               "  No message? Open System Settings → Privacy & Security → Local Network and turn on\n"
+               "  Network View.")
+_ALLOW_HELP_PYTHON = ("macOS is blocking the service's network access. Open System Settings →\n"
+                      "  Privacy & Security → Local Network and turn on Python (it may be listed as\n"
+                      "  “python3”).")
+
+
 def _port_from(server_args: list[str]) -> int:
     from .server import build_parser
     return build_parser().parse_args(server_args).port
@@ -92,6 +113,8 @@ def _port_from(server_args: list[str]) -> int:
 def launch_agent_plist(python: str, server_args: list[str]) -> dict:
     return {
         "Label": LABEL,
+        # Shown as "Network View" (not "python3") under Login Items in System Settings.
+        "AssociatedBundleIdentifiers": [f"{LABEL}.launcher"],
         "ProgramArguments": [python, "-m", "netview", "--no-browser", *server_args],
         "WorkingDirectory": str(PROJECT_ROOT),
         "EnvironmentVariables": {
@@ -154,13 +177,90 @@ def app_info_plist() -> dict:
     }
 
 
+# --------------------------------------------------------------------------
+# The agent: the server's own app identity, so macOS can ask about it
+# --------------------------------------------------------------------------
+#
+# macOS 15+ only lets an app reach the local network after asking the user,
+# and it can only ask about (and list in System Settings) code that belongs to
+# an app. Run straight from launchd, Python's command-line launcher belongs to
+# no app, so macOS silently blocks it, whatever Python.app's switch says.
+# So the service runs a copy of the real interpreter as the main program of a
+# small "Network View" app, signed locally (ad hoc, no Apple account).
+
+def real_interpreter() -> Path | None:
+    """The interpreter that framework builds (python.org, Homebrew) really run.
+
+    `python3` there is a stub that re-launches .../Resources/Python.app; that
+    executable links the Python framework by absolute path, so a copy of it
+    still finds the standard library.
+    """
+    cand = Path(sys.base_prefix) / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    return cand if cand.is_file() else None
+
+
+def agent_info_plist() -> dict:
+    return {
+        "CFBundleName": "Network View",
+        "CFBundleDisplayName": "Network View",
+        "CFBundleIdentifier": AGENT_ID,
+        "CFBundleExecutable": AGENT_EXE_NAME,
+        "CFBundleIconFile": "AppIcon",
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": _version(),
+        "CFBundleVersion": _version(),
+        "LSMinimumSystemVersion": "11.0",
+        "LSBackgroundOnly": True,
+        "NSLocalNetworkUsageDescription": LOCAL_NETWORK_REASON,
+    }
+
+
+def build_agent(app_dir: Path, icon: Path | None = None) -> Path | None:
+    """Build the agent inside app_dir; return its executable, or None if this
+    Python can't be run that way (the service then uses python3 directly)."""
+    src = real_interpreter()
+    if not src:
+        return None
+    agent = app_dir / AGENT_REL
+    shutil.rmtree(agent, ignore_errors=True)
+    (agent / "Contents" / "MacOS").mkdir(parents=True)
+    (agent / "Contents" / "Resources").mkdir()
+    with open(agent / "Contents" / "Info.plist", "wb") as f:
+        plistlib.dump(agent_info_plist(), f)
+    if icon and icon.exists():
+        shutil.copy2(icon, agent / "Contents" / "Resources" / "AppIcon.icns")
+    exe = agent / "Contents" / "MacOS" / AGENT_EXE_NAME
+    shutil.copy2(src, exe)
+    # Re-sign as our own bundle (the copy still carries Python's signature,
+    # which names Python.app). Ad hoc: no certificate needed.
+    if shutil.which("codesign"):
+        r = _run(["codesign", "--force", "--sign", "-", "--identifier", AGENT_ID, str(agent)])
+        if r.returncode != 0:
+            shutil.rmtree(agent, ignore_errors=True)
+            return None
+    if not agent_works(exe):
+        shutil.rmtree(agent, ignore_errors=True)
+        return None
+    return exe
+
+
+def agent_works(exe: Path) -> bool:
+    """Can the copied interpreter start and import Network View?"""
+    try:
+        r = subprocess.run([str(exe), "-c", "import netview.server"], capture_output=True, timeout=30,
+                           env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)})
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _version() -> str:
     from . import __version__
     return __version__
 
 
-def build_app(port: int, dest: Path | None = None) -> bool:
-    """Create the app bundle. Returns whether a custom icon was added."""
+def build_app(port: int, dest: Path | None = None) -> tuple[bool, Path | None]:
+    """Create the app bundle. Returns (has custom icon, agent executable or None)."""
     dest = dest or APP
     tmp = dest.with_name(dest.name + ".tmp")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -171,11 +271,13 @@ def build_app(port: int, dest: Path | None = None) -> bool:
     exe = tmp / "Contents" / "MacOS" / "network-view"
     exe.write_text(launcher_script(port))
     exe.chmod(0o755)
-    has_icon = make_icns(tmp / "Contents" / "Resources" / "AppIcon.icns")
+    icns = tmp / "Contents" / "Resources" / "AppIcon.icns"
+    has_icon = make_icns(icns)
+    agent_exe = build_agent(tmp, icns)
     shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp.rename(dest)
-    return has_icon
+    return has_icon, (dest / agent_exe.relative_to(tmp)) if agent_exe else None
 
 
 # --------------------------------------------------------------------------
@@ -275,8 +377,15 @@ def _wait_until_up(port: int, seconds: float = 20) -> bool:
     return False
 
 
-def _first_scan_status(port: int, seconds: float = 90) -> dict | None:
-    """Wait for the first scan to finish; return its status block."""
+def _first_scan_status(port: int, seconds: float = 90, unblocked: bool = False) -> dict | None:
+    """Wait for a finished scan and return its status block.
+
+    Normally returns the first conclusive state (scan done, paused, or blocked).
+    With `unblocked`, waits instead for a finished scan that wasn't blocked:
+    used once macOS's Local Network permission has been requested. That can be
+    the very scan that was running when the user clicked Allow (the block is
+    lifted mid-scan when devices start answering), so don't insist on a newer one.
+    """
     import json
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     deadline = time.time() + seconds
@@ -285,8 +394,12 @@ def _first_scan_status(port: int, seconds: float = 90) -> dict | None:
             with opener.open(f"http://127.0.0.1:{port}/api/devices", timeout=2) as r:
                 data = json.loads(r.read())
             st = data["status"]
-            if (st.get("lan_blocked") or st.get("state") == "paused"
-                    or (st.get("state") != "scanning" and st.get("last_scan"))):
+            done = st.get("state") != "scanning" and st.get("last_scan")
+            if unblocked:
+                ready = not st.get("lan_blocked") and (done or st.get("state") == "paused")
+            else:
+                ready = st.get("lan_blocked") or st.get("state") == "paused" or done
+            if ready:
                 return {**st, "online": sum(1 for d in data["devices"] if d.get("online"))}
         except Exception:
             pass
@@ -324,18 +437,22 @@ def install(server_args: list[str]) -> int:
               f"then run this again.\nOr install on another port: python3 -m netview install --port {port + 1}")
         return 1
 
+    # The app comes first: the service runs the agent inside it.
+    has_icon, agent_exe = build_app(port)
     PLIST.parent.mkdir(parents=True, exist_ok=True)
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(PLIST, "wb") as f:
-        plistlib.dump(launch_agent_plist(sys.executable, server_args), f)
+        plistlib.dump(launch_agent_plist(str(agent_exe or sys.executable), server_args), f)
     r = _run(["launchctl", "bootstrap", _domain(), str(PLIST)])
     if r.returncode != 0 and not _service_loaded():
         print(f"macOS wouldn't start the background service:\n  {r.stderr.strip() or r.stdout.strip()}")
         return 1
 
-    has_icon = build_app(port)
-    print(f"✓ Background service installed{' (updated)' if was_loaded else ''}. It starts when you log in.")
     print(f"✓ App added: {APP}{'' if has_icon else ' (without a custom icon)'}")
+    print(f"✓ Background service installed{' (updated)' if was_loaded else ''}. It starts when you log in.")
+    if not agent_exe:
+        print("• This Python can't run as the service's own app, so it runs as python3. macOS may\n"
+              "  block its network access; see the README's macOS section if devices are missing.")
 
     if not _wait_until_up(port):
         print(f"\n✗ The service didn't start. Last lines of {LOG}:\n{_tail_log()}")
@@ -344,10 +461,14 @@ def install(server_args: list[str]) -> int:
     print("\nChecking it can see your network (the first scan takes up to a minute)…")
     st = _first_scan_status(port)
     if st and st.get("lan_blocked"):
-        print("✗ macOS is blocking local network access for the background service.\n"
-              "  Open System Settings → Privacy & Security → Local Network and turn on Python\n"
-              "  (it may be listed as “python3”). Then run: python3 -m netview status\n"
-              "  If Python isn't listed there, see the README's macOS section.")
+        print(f"\n{_ALLOW_HELP if agent_exe else _ALLOW_HELP_PYTHON}\n\nWaiting for access (up to 3 minutes)…")
+        st = _first_scan_status(port, seconds=180, unblocked=True)
+        if st is None:
+            print("✗ Still blocked. Once you've allowed it, run: python3 -m netview status")
+        elif st.get("state") == "paused":
+            print("✓ Network access allowed.")
+        else:
+            print(f"✓ Network access allowed. Found {st['online']} device{'s' if st['online'] != 1 else ''}.")
     elif st and st.get("state") == "paused":
         print("• This network isn't marked as your home network, so scanning is paused.\n"
               "  If it is yours, open the app and click “Trust this network”.")
@@ -403,8 +524,10 @@ def status() -> int:
     if up:
         st = _first_scan_status(port, seconds=5)
         if st and st.get("lan_blocked"):
-            print("\n✗ macOS is blocking local network access. Turn on Python in System Settings →\n"
-                  "  Privacy & Security → Local Network.")
+            runs_agent = bool(_installed_program()) and AGENT_EXE_NAME in _installed_program()
+            print("\n✗ macOS is blocking local network access.\n"
+                  + (_ALLOW_HELP if runs_agent else _ALLOW_HELP_PYTHON + "\n  Or run 'python3 -m netview install'"
+                     " again: this version installs the service as its own app, which fixes it."))
     else:
         print(f"\nLast lines of the log:\n{_tail_log()}")
     return 0 if up else 1

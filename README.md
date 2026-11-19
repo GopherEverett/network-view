@@ -43,7 +43,12 @@ python3 -m netview uninstall
 
 `status` shows whether it's running, its options and recent log lines. `uninstall` removes the service and the app, but keeps your device history in `~/.network-view`.
 
-**Local Network permission (macOS 15 and later).** macOS asks before an app can reach devices on your network. Terminal already has permission, but the background service is a separate program. If macOS blocks it, the dashboard shows a banner and the installer says so. Open **System Settings → Privacy & Security → Local Network**, turn on **Python** (it may be listed as "python3"), then click **Scan now**. If Python doesn't appear in that list, run `python3 -m netview uninstall` and start Network View from Terminal instead, which uses Terminal's permission.
+**Local Network permission (macOS 15 and later).** macOS asks before an app can reach devices on your network, and it can only ask about programs that belong to an app. So the installer builds a small helper app named **Network View** inside `Network View.app`. It runs a copy of your Python interpreter, signed on your Mac with no Apple account involved. Expect to see:
+
+- **The prompt:** right after installing, macOS asks *"Network View" would like to find devices on your local network*. Click **Allow**. The installer waits for that and then reports how many devices it found.
+- **No prompt?** Open **System Settings → Privacy & Security → Local Network** and turn on **Network View**. Scanning restarts within 30 seconds.
+- **After reinstalling,** macOS may ask again, because each install signs the helper app afresh.
+- **Pythons that can't be copied this way:** this works with Python from python.org and Homebrew. With other Pythons, the installer says it couldn't build the helper app and falls back to running `python3`, which macOS may block. If so, run Network View from Terminal instead, which uses Terminal's permission.
 
 The service runs the code from the folder you installed it from. After moving that folder, or after a `git pull` that changes the code, run `install` again (or `launchctl kickstart -k gui/$(id -u)/local.network-view`) so the service picks it up. The log is at `~/Library/Logs/network-view.log`.
 

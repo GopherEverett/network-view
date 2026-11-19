@@ -518,7 +518,10 @@ def main(argv=None) -> None:
             except Exception:
                 continue
             due = args.interval > 0 and time.time() - last_auto >= args.interval
-            if info["changed"] or due:
+            # Blocked by macOS's Local Network setting? Rescan as soon as it's allowed.
+            unblocked = (inv.status.get("lan_blocked") and inv.status["state"] == "idle"
+                         and not scanner.local_network_blocked(inv.network.gateway))
+            if info["changed"] or due or unblocked:
                 if inv.start_scan():
                     last_auto = time.time()
     threading.Thread(target=watch_network, daemon=True).start()
