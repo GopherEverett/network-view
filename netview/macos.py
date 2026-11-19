@@ -377,12 +377,14 @@ def _wait_until_up(port: int, seconds: float = 20) -> bool:
     return False
 
 
-def _first_scan_status(port: int, seconds: float = 90, after: float | None = None) -> dict | None:
+def _first_scan_status(port: int, seconds: float = 90, unblocked: bool = False) -> dict | None:
     """Wait for a finished scan and return its status block.
 
     Normally returns the first conclusive state (scan done, paused, or blocked).
-    With `after`, waits instead for an unblocked scan newer than that time:
-    used once macOS's Local Network permission has been granted.
+    With `unblocked`, waits instead for a finished scan that wasn't blocked:
+    used once macOS's Local Network permission has been requested. That can be
+    the very scan that was running when the user clicked Allow (the block is
+    lifted mid-scan when devices start answering), so don't insist on a newer one.
     """
     import json
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -393,9 +395,8 @@ def _first_scan_status(port: int, seconds: float = 90, after: float | None = Non
                 data = json.loads(r.read())
             st = data["status"]
             done = st.get("state") != "scanning" and st.get("last_scan")
-            if after is not None:
-                ready = (not st.get("lan_blocked") and ((done and st["last_scan"] > after)
-                                                       or st.get("state") == "paused"))
+            if unblocked:
+                ready = not st.get("lan_blocked") and (done or st.get("state") == "paused")
             else:
                 ready = st.get("lan_blocked") or st.get("state") == "paused" or done
             if ready:
@@ -461,7 +462,7 @@ def install(server_args: list[str]) -> int:
     st = _first_scan_status(port)
     if st and st.get("lan_blocked"):
         print(f"\n{_ALLOW_HELP if agent_exe else _ALLOW_HELP_PYTHON}\n\nWaiting for access (up to 3 minutes)…")
-        st = _first_scan_status(port, seconds=180, after=st.get("last_scan") or time.time())
+        st = _first_scan_status(port, seconds=180, unblocked=True)
         if st is None:
             print("✗ Still blocked. Once you've allowed it, run: python3 -m netview status")
         elif st.get("state") == "paused":

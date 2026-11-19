@@ -99,6 +99,52 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(p["AssociatedBundleIdentifiers"], ["local.network-view.launcher"])
 
 
+class WaitForScanTests(unittest.TestCase):
+    """_first_scan_status against a sequence of real-shaped API responses."""
+
+    def run_sequence(self, responses, **kw):
+        import io
+        import json as _json
+        it = iter(responses)
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class Opener:
+            def open(self, url, timeout=None):
+                return Resp(_json.dumps(next(it)).encode())
+
+        with mock.patch.object(macos.urllib.request, "build_opener", return_value=Opener()), \
+                mock.patch.object(macos.time, "sleep"):
+            return macos._first_scan_status(8765, seconds=3600, **kw)
+
+    def test_allow_clicked_during_first_scan(self):
+        # What happened on a real Mac: the first scan starts blocked; the user
+        # clicks Allow; that same scan then finds devices and lifts the block.
+        dev = lambda online: {"online": online}
+        seq = [
+            {"status": {"state": "scanning", "lan_blocked": True, "last_scan": None}, "devices": [dev(True)]},
+            {"status": {"state": "scanning", "lan_blocked": True, "last_scan": None}, "devices": [dev(True)]},
+            {"status": {"state": "idle", "lan_blocked": False, "last_scan": 50},
+             "devices": [dev(True)] * 12},
+        ]
+        first = self.run_sequence(seq[:1])
+        self.assertTrue(first["lan_blocked"])
+        done = self.run_sequence(seq[1:], unblocked=True)
+        self.assertEqual(done["online"], 12)
+
+    def test_unblocked_waits_while_still_blocked(self):
+        seq = [{"status": {"state": "idle", "lan_blocked": True, "last_scan": 1}, "devices": []}] * 3 + [
+            {"status": {"state": "scanning", "lan_blocked": False, "last_scan": 1}, "devices": []},
+            {"status": {"state": "idle", "lan_blocked": False, "last_scan": 2}, "devices": [{"online": True}] * 4},
+        ]
+        self.assertEqual(self.run_sequence(seq, unblocked=True)["online"], 4)
+
+
 class InstallFlowTests(unittest.TestCase):
     """Install/uninstall with launchctl and the network replaced by fakes."""
 
@@ -173,7 +219,7 @@ class InstallFlowTests(unittest.TestCase):
         text = "\n".join(str(c.args[0]) for c in out.call_args_list)
         self.assertIn("Privacy & Security → Local Network", text)
         self.assertIn("Found 9 devices", text)
-        self.assertEqual(fss.call_args_list[1].kwargs["after"], 100)  # waits for a newer scan
+        self.assertTrue(fss.call_args_list[1].kwargs["unblocked"])
 
     def test_install_still_blocked(self):
         with mock.patch.object(macos, "_port_busy", return_value=False), \
